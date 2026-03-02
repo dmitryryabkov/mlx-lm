@@ -269,7 +269,7 @@ mlx_lm.server \
   --max-prompt-tokens 8192 \
   --prompt-overflow-policy truncate \
   --prompt-keep-tokens 512 \
-  --kv-bits 4 \
+  --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 0 \
   --prompt-cache-bytes 3G \
@@ -278,9 +278,12 @@ mlx_lm.server \
 
 Notes:
 
-- `--max-kv-size` and `--kv-bits` are currently mutually exclusive.
+- `--max-kv-size` can be combined with `--kv-bits` for non-MLA models.
 - When `--kv-bits` is enabled, server batching is disabled.
-- KV quantization is currently not supported for MLA-style model architectures.
+- For MLA-style model architectures (for example GLM/DeepSeek variants):
+  - `--kv-bits` is supported when `--max-kv-size` is not set.
+  - `--kv-bits 8` is recommended.
+  - `--kv-bits 4` is currently experimental and may hang or degrade performance.
 - `--max-prompt-tokens` is the primary control to stop memory creep across long chats.
 - OOM-style failures now return HTTP `503` instead of crashing the server
   process.
