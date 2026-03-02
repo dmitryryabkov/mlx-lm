@@ -279,6 +279,8 @@ mlx_lm.server \
 Notes:
 
 - `--max-kv-size` and `--kv-bits` are currently mutually exclusive.
+- When `--kv-bits` is enabled, server batching is disabled.
+- KV quantization is currently not supported for MLA-style model architectures.
 - `--max-prompt-tokens` is the primary control to stop memory creep across long chats.
 - OOM-style failures now return HTTP `503` instead of crashing the server
   process.

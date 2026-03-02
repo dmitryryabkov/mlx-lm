@@ -18,6 +18,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     apply_prompt_token_limit,
     is_metal_oom_error,
+    kv_quantization_incompatibility_reason,
     model_supports_kv_quantization,
     projected_kv_bytes,
 )
@@ -666,6 +667,38 @@ class TestKVQuantModelCompatibility(unittest.TestCase):
     def test_non_mla_models_report_supported(self):
         model = type("obj", (), {"args": type("obj", (), {"hidden_size": 1024})()})()
         self.assertTrue(model_supports_kv_quantization(model))
+
+    def test_incompatibility_reason_for_mla_models(self):
+        model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
+        self.assertIn("MLA-style models", kv_quantization_incompatibility_reason(model))
+
+
+class TestKVQuantPromptCacheGuard(unittest.TestCase):
+    def test_make_prompt_cache_rejects_incompatible_model(self):
+        from unittest.mock import patch
+
+        rg = ResponseGenerator.__new__(ResponseGenerator)
+        rg.model_provider = type(
+            "obj",
+            (),
+            {
+                "cli_args": type(
+                    "obj",
+                    (),
+                    {
+                        "max_kv_size": None,
+                        "kv_bits": 4,
+                        "kv_group_size": 64,
+                        "quantized_kv_start": 0,
+                    },
+                )(),
+            },
+        )()
+
+        model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
+        with patch("mlx_lm.server.make_prompt_cache", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "MLA-style models"):
+                rg._make_prompt_cache(model)
 
 
 class TestPromptTokenLimit(unittest.TestCase):
