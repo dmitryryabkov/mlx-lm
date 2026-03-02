@@ -736,6 +736,26 @@ class TestKVQuantStartupValidation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Disable --kv-bits"):
                 provider.load("any-model")
 
+    def test_load_rejects_incompatible_default_model_with_real_name(self):
+        args = self._cli_args()
+        args.model = "mlx-community/Foo-MLA-4bit"
+        incompatible_model = type(
+            "obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()}
+        )()
+        tokenizer = type(
+            "obj",
+            (),
+            {
+                "vocab_size": 100,
+                "chat_template": None,
+                "default_chat_template": None,
+            },
+        )()
+
+        with patch("mlx_lm.server.load", return_value=(incompatible_model, tokenizer)):
+            with self.assertRaisesRegex(ValueError, args.model):
+                ModelProvider(args)
+
     def test_load_allows_compatible_model_when_kv_bits_enabled(self):
         args = self._cli_args()
         compatible_model = type(

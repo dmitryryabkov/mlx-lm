@@ -567,6 +567,8 @@ class ModelProvider:
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        requested_model_path = model_path
+        requested_draft_model_path = draft_model_path
         model_path = self.default_model_map.get(model_path, model_path)
         if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
@@ -644,14 +646,24 @@ class ModelProvider:
             validate_draft_tokenizer(draft_tokenizer)
 
         if self.cli_args.kv_bits is not None:
+            display_model_path = (
+                self.cli_args.model
+                if requested_model_path == "default_model"
+                else requested_model_path
+            )
             if reason := kv_quantization_incompatibility_reason(self.model):
                 raise ValueError(
-                    f"{reason} Disable --kv-bits for model '{model_path}'."
+                    f"{reason} Disable --kv-bits for model '{display_model_path}'."
                 )
             if self.draft_model is not None:
+                display_draft_model_path = (
+                    self.cli_args.draft_model
+                    if requested_draft_model_path == "default_model"
+                    else requested_draft_model_path
+                )
                 if reason := kv_quantization_incompatibility_reason(self.draft_model):
                     raise ValueError(
-                        f"{reason} Disable --kv-bits for draft model '{draft_model_path}'."
+                        f"{reason} Disable --kv-bits for draft model '{display_draft_model_path}'."
                     )
 
         if self.draft_model is None:
