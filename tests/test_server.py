@@ -11,7 +11,16 @@ from unittest.mock import patch
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import (
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    QuantizedKVCache,
+    QuantizedRotatingKVCache,
+    RotatingKVCache,
+    cache_quantization_incompatibility_reason,
+    can_quantize_cache,
+)
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
@@ -622,6 +631,26 @@ class TestKVBudgeting(unittest.TestCase):
         self.assertEqual(cache.nbytes, 0)
 
 
+class TestCacheQuantizationCapabilities(unittest.TestCase):
+    def test_kv_cache_is_quantizable(self):
+        self.assertTrue(can_quantize_cache(KVCache()))
+        self.assertIsNone(cache_quantization_incompatibility_reason(KVCache()))
+
+    def test_rotating_cache_is_quantizable(self):
+        cache = RotatingKVCache(max_size=128)
+        self.assertTrue(can_quantize_cache(cache))
+        self.assertIsNone(cache_quantization_incompatibility_reason(cache))
+        self.assertIsInstance(cache.to_quantized(), QuantizedRotatingKVCache)
+
+    def test_cache_list_reports_nested_incompatibility(self):
+        cache = CacheList(
+            KVCache(), BatchRotatingKVCache(max_size=64, left_padding=[0])
+        )
+        reason = cache_quantization_incompatibility_reason(cache)
+        self.assertIsNotNone(reason)
+        self.assertIn("CacheList[1]", reason)
+
+
 class TestBatchability(unittest.TestCase):
     def _make_response_generator(self, is_batchable=True, kv_bits=None):
         rg = ResponseGenerator.__new__(ResponseGenerator)
@@ -645,7 +674,7 @@ class TestBatchability(unittest.TestCase):
 
 
 class TestCLIValidation(unittest.TestCase):
-    def test_reject_max_kv_size_with_kv_bits(self):
+    def test_allow_max_kv_size_with_kv_bits(self):
         from mlx_lm import server as server_module
 
         argv = [
@@ -656,7 +685,7 @@ class TestCLIValidation(unittest.TestCase):
             "4",
         ]
         with patch.object(sys, "argv", argv):
-            with self.assertRaisesRegex(ValueError, "cannot be used with --kv-bits"):
+            with patch("mlx_lm.server.run"):
                 server_module.main()
 
 
@@ -672,6 +701,17 @@ class TestKVQuantModelCompatibility(unittest.TestCase):
     def test_incompatibility_reason_for_mla_models(self):
         model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
         self.assertIn("MLA-style models", kv_quantization_incompatibility_reason(model))
+
+    def test_rotating_cache_model_reports_supported(self):
+        model = type(
+            "obj",
+            (),
+            {
+                "make_cache": lambda self: [RotatingKVCache(max_size=128)],
+                "args": type("obj", (), {"hidden_size": 1024})(),
+            },
+        )()
+        self.assertIsNone(kv_quantization_incompatibility_reason(model))
 
 
 class TestKVQuantPromptCacheGuard(unittest.TestCase):

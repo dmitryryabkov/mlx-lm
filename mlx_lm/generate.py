@@ -33,6 +33,7 @@ from .models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
+    quantize_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -296,11 +297,12 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            try:
-                prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
-            except NotImplementedError:
-                continue
+        cache_offset = getattr(c, "offset", None)
+        if cache_offset is None and hasattr(c, "size"):
+            cache_offset = c.size()
+        if cache_offset is None or cache_offset < quantized_kv_start:
+            continue
+        prompt_cache[e] = quantize_cache(c, group_size=kv_group_size, bits=kv_bits)
 
 
 def generate_step(

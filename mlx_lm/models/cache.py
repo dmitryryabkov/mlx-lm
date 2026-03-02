@@ -123,6 +123,12 @@ def create_attention_mask(
 
 
 class _BaseCache:
+    supports_quantization = False
+    quantization_mode = "none"
+
+    def quantization_incompatibility_reason(self):
+        return f"{type(self).__name__} does not support KV quantization."
+
     @property
     def state(self):
         return []
@@ -229,6 +235,8 @@ class ConcatenateKVCache(_BaseCache):
 
 class QuantizedKVCache(_BaseCache):
     step = 256
+    supports_quantization = True
+    quantization_mode = "full"
 
     def __init__(self, group_size: int = 64, bits: int = 8):
         self.keys = None
@@ -328,6 +336,8 @@ class QuantizedKVCache(_BaseCache):
 
 class KVCache(_BaseCache):
     step = 256
+    supports_quantization = True
+    quantization_mode = "full"
 
     def __init__(self):
         self.keys = None
@@ -413,6 +423,8 @@ class KVCache(_BaseCache):
 
 class RotatingKVCache(_BaseCache):
     step = 256
+    supports_quantization = True
+    quantization_mode = "full"
 
     def __init__(self, max_size, keep=0):
         self.keep = keep
@@ -552,8 +564,18 @@ class RotatingKVCache(_BaseCache):
         self._idx -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        raise NotImplementedError("RotatingKVCache Quantization NYI")
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        quant_cache = QuantizedRotatingKVCache(
+            self.max_size, keep=self.keep, group_size=group_size, bits=bits
+        )
+        quant_cache.offset = self.offset
+        quant_cache._idx = self._idx
+        if self.keys is not None:
+            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            quant_cache.values = mx.quantize(
+                self.values, group_size=group_size, bits=bits
+            )
+        return quant_cache
 
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
@@ -593,6 +615,150 @@ class RotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class QuantizedRotatingKVCache(_BaseCache):
+    supports_quantization = True
+    quantization_mode = "full"
+
+    def __init__(
+        self, max_size: int, keep: int = 0, group_size: int = 64, bits: int = 4
+    ):
+        self.keep = keep
+        self.max_size = max_size
+        self.group_size = group_size
+        self.bits = bits
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self._idx = 0
+
+    def _dequantize(self, q):
+        if q is None:
+            return None
+        return mx.dequantize(*q, group_size=self.group_size, bits=self.bits)
+
+    def _quantize(self, x):
+        if x is None:
+            return None
+        return mx.quantize(x, group_size=self.group_size, bits=self.bits)
+
+    def _to_dense_cache(self) -> RotatingKVCache:
+        dense = RotatingKVCache(max_size=self.max_size, keep=self.keep)
+        dense.offset = self.offset
+        dense._idx = self._idx
+        if self.keys is not None:
+            dense.keys = self._dequantize(self.keys)
+            dense.values = self._dequantize(self.values)
+        return dense
+
+    def update_and_fetch(self, keys, values):
+        dense = self._to_dense_cache()
+        out_keys, out_values = dense.update_and_fetch(keys, values)
+        self.offset = dense.offset
+        self._idx = dense._idx
+        self.keys = self._quantize(dense.keys)
+        self.values = self._quantize(dense.values)
+        return self._quantize(out_keys), self._quantize(out_values)
+
+    def size(self):
+        return min(self.offset, self.max_size)
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return self.keys, self.values
+        if self.offset < self.keys[0].shape[2]:
+            return (
+                tree_map(lambda x: x[..., : self.offset, :], self.keys),
+                tree_map(lambda x: x[..., : self.offset, :], self.values),
+            )
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.keep,
+                    self.max_size,
+                    self.offset,
+                    self._idx,
+                    self.group_size,
+                    self.bits,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        (
+            self.keep,
+            self.max_size,
+            self.offset,
+            self._idx,
+            self.group_size,
+            self.bits,
+        ) = map(int, v)
+
+    def is_trimmable(self):
+        return self.offset < self.max_size
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        self._idx -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        if self.group_size == group_size and self.bits == bits:
+            return self
+        dense = self._to_dense_cache()
+        return dense.to_quantized(group_size=group_size, bits=bits)
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        if N > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size - 1, self.offset)
+            if offset + N > window_size or return_array:
+                return create_causal_mask(N, offset, window_size=window_size)
+            else:
+                return "causal"
+        else:
+            if window_size is None:
+                return None
+            # May need a mask for when window_size < max_size
+            if self.offset >= window_size and self.max_size > window_size:
+                idx = self._idx
+                if idx >= self.max_size:
+                    idx = 0
+                if self.offset < self.max_size:
+                    mask_size = self.offset + 1
+                else:
+                    mask_size = self.max_size
+                mask = mx.arange(mask_size) >= (mask_size - window_size)
+                mask = mx.roll(mask, shift=idx + 1)
+                return mask
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(
+            lambda a, x: a + (x.nbytes if x is not None else 0),
+            (self.keys, self.values),
+            0,
+        )
 
 
 class ArraysCache(_BaseCache):
@@ -1063,6 +1229,8 @@ class BatchKVCache(_BaseCache):
 
 class BatchRotatingKVCache(_BaseCache):
     step = 256
+    supports_quantization = False
+    quantization_mode = "none"
 
     def __init__(self, max_size, left_padding: List[int]):
         self.keys = None
@@ -1251,6 +1419,9 @@ class BatchRotatingKVCache(_BaseCache):
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("BatchRotatingKVCache Quantization NYI")
 
+    def quantization_incompatibility_reason(self):
+        return "BatchRotatingKVCache quantization is not implemented yet."
+
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
     ):
@@ -1380,3 +1551,49 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+def cache_quantization_incompatibility_reason(cache: _BaseCache) -> Optional[str]:
+    if isinstance(cache, CacheList):
+        for i, sub_cache in enumerate(cache.caches):
+            if reason := cache_quantization_incompatibility_reason(sub_cache):
+                return f"CacheList[{i}]: {reason}"
+        return None
+
+    if isinstance(cache, QuantizedKVCache):
+        return None
+
+    if getattr(cache, "supports_quantization", False) and hasattr(
+        cache, "to_quantized"
+    ):
+        return None
+
+    if hasattr(cache, "quantization_incompatibility_reason"):
+        return cache.quantization_incompatibility_reason()
+    return f"{type(cache).__name__} does not support KV quantization."
+
+
+def can_quantize_cache(cache: _BaseCache) -> bool:
+    return cache_quantization_incompatibility_reason(cache) is None
+
+
+def quantize_cache(
+    cache: _BaseCache, *, group_size: int = 64, bits: int = 4
+) -> _BaseCache:
+    if isinstance(cache, CacheList):
+        return CacheList(
+            *(quantize_cache(c, group_size=group_size, bits=bits) for c in cache.caches)
+        )
+
+    if reason := cache_quantization_incompatibility_reason(cache):
+        raise ValueError(reason)
+
+    if isinstance(cache, QuantizedKVCache):
+        return cache
+
+    try:
+        return cache.to_quantized(group_size=group_size, bits=bits)
+    except NotImplementedError as exc:
+        raise ValueError(
+            f"{type(cache).__name__} reports KV quantization support but conversion is not implemented."
+        ) from exc
