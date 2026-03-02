@@ -650,6 +650,16 @@ class TestCacheQuantizationCapabilities(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("CacheList[1]", reason)
 
+    def test_quantized_rotating_cache_updates_in_place(self):
+        cache = RotatingKVCache(max_size=8).to_quantized(group_size=32, bits=8)
+        for _ in range(16):
+            keys = mx.random.normal((1, 2, 1, 32))
+            values = mx.random.normal((1, 2, 1, 32))
+            qk, qv = cache.update_and_fetch(keys, values)
+            self.assertIsInstance(qk, tuple)
+            self.assertIsInstance(qv, tuple)
+        self.assertLessEqual(cache.size(), 8)
+
 
 class TestBatchability(unittest.TestCase):
     def _make_response_generator(self, is_batchable=True, kv_bits=None):
