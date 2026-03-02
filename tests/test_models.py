@@ -274,6 +274,24 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_mla_quantized_cache_uses_dense_sdpa_path(self):
+        cache = KVCache().to_mla_quantized(group_size=32, bits=8)
+
+        k = 1e-1 * mx.random.normal(shape=(1, 1, 8, 32))
+        v = 1e-1 * mx.random.normal(shape=(1, 1, 8, 16))
+        k_up, v_up = cache.update_and_fetch(k, v)
+
+        q = 1e-1 * mx.random.normal(shape=(1, 1, 8, 32))
+        out = scaled_dot_product_attention(
+            q,
+            k_up,
+            v_up,
+            cache=cache,
+            mask="causal",
+            scale=1.0,
+        )
+        self.assertEqual(out.shape, (1, 1, 8, 16))
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)

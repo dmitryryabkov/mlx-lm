@@ -114,7 +114,14 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
-    if hasattr(cache, "bits"):
+    def _is_quantized_triplet(x):
+        return isinstance(x, (tuple, list)) and len(x) == 3
+
+    if (
+        hasattr(cache, "bits")
+        and _is_quantized_triplet(keys)
+        and _is_quantized_triplet(values)
+    ):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
         return quantized_scaled_dot_product_attention(
