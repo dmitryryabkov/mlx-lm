@@ -293,7 +293,9 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+def maybe_quantize_kv_cache(
+    prompt_cache, quantized_kv_start, kv_group_size, kv_bits, mla_mode=False
+):
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
@@ -302,7 +304,9 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             cache_offset = c.size()
         if cache_offset is None or cache_offset < quantized_kv_start:
             continue
-        prompt_cache[e] = quantize_cache(c, group_size=kv_group_size, bits=kv_bits)
+        prompt_cache[e] = quantize_cache(
+            c, group_size=kv_group_size, bits=kv_bits, mla_mode=mla_mode
+        )
 
 
 def generate_step(
@@ -382,6 +386,7 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        mla_mode=hasattr(getattr(model, "args", None), "kv_lora_rank"),
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -529,13 +534,6 @@ def speculative_generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    quantize_cache_fn = functools.partial(
-        maybe_quantize_kv_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=kv_bits,
-    )
-
     def _process_and_sample(tokens, logits):
         if logits_processors:
             for processor in logits_processors:
@@ -550,7 +548,13 @@ def speculative_generate_step(
             logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
-            quantize_cache_fn(cache)
+            maybe_quantize_kv_cache(
+                cache,
+                quantized_kv_start=quantized_kv_start,
+                kv_group_size=kv_group_size,
+                kv_bits=kv_bits,
+                mla_mode=hasattr(getattr(model, "args", None), "kv_lora_rank"),
+            )
             if logits_processors:
                 nonlocal prev_tokens
                 out_y, out_logprobs = [], []

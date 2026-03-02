@@ -93,14 +93,14 @@ def projected_kv_bytes(prompt_cache: List[Any], extra_tokens: int) -> int:
     return cache_bytes + int(bytes_per_token * extra_tokens)
 
 
-def kv_quantization_incompatibility_reason(model: Any) -> Optional[str]:
-    # MLA-style models store extra latent structures in the KV cache and are
-    # currently incompatible with QuantizedKVCache update/fetch semantics.
+def kv_quantization_incompatibility_reason(
+    model: Any, *, max_kv_size: Optional[int] = None
+) -> Optional[str]:
     args = getattr(model, "args", None)
-    if args is not None and hasattr(args, "kv_lora_rank"):
+    if args is not None and hasattr(args, "kv_lora_rank") and max_kv_size is not None:
         return (
-            "KV quantization is not currently supported for MLA-style models "
-            "(detected kv_lora_rank in model args)."
+            "KV quantization with rotating cache (--max-kv-size) is not currently "
+            "supported for MLA-style models (detected kv_lora_rank in model args)."
         )
     try:
         prompt_cache = make_prompt_cache(model)
@@ -664,7 +664,9 @@ class ModelProvider:
                 if requested_model_path == "default_model"
                 else requested_model_path
             )
-            if reason := kv_quantization_incompatibility_reason(self.model):
+            if reason := kv_quantization_incompatibility_reason(
+                self.model, max_kv_size=self.cli_args.max_kv_size
+            ):
                 raise ValueError(
                     f"{reason} Disable --kv-bits for model '{display_model_path}'."
                 )
@@ -674,7 +676,9 @@ class ModelProvider:
                     if requested_draft_model_path == "default_model"
                     else requested_draft_model_path
                 )
-                if reason := kv_quantization_incompatibility_reason(self.draft_model):
+                if reason := kv_quantization_incompatibility_reason(
+                    self.draft_model, max_kv_size=self.cli_args.max_kv_size
+                ):
                     raise ValueError(
                         f"{reason} Disable --kv-bits for draft model '{display_draft_model_path}'."
                     )
@@ -863,18 +867,30 @@ class ResponseGenerator:
         return True
 
     def _make_prompt_cache(self, model, draft_model=None):
-        cache = make_prompt_cache(
+        model_cache = make_prompt_cache(
             model,
             max_kv_size=self.model_provider.cli_args.max_kv_size,
         )
+        cache = model_cache
+        draft_cache = []
         if draft_model is not None:
-            cache += make_prompt_cache(
+            draft_cache = make_prompt_cache(
                 draft_model,
                 max_kv_size=self.model_provider.cli_args.max_kv_size,
             )
+            cache += draft_cache
         if self.model_provider.cli_args.kv_bits is not None:
-            if reason := kv_quantization_incompatibility_reason(model):
+            if reason := kv_quantization_incompatibility_reason(
+                model, max_kv_size=self.model_provider.cli_args.max_kv_size
+            ):
                 raise ValueError(f"{reason} Disable --kv-bits for this model.")
+            if draft_model is not None:
+                if reason := kv_quantization_incompatibility_reason(
+                    draft_model, max_kv_size=self.model_provider.cli_args.max_kv_size
+                ):
+                    raise ValueError(
+                        f"{reason} Disable --kv-bits for this draft model."
+                    )
             for i, c in enumerate(cache):
                 if reason := cache_quantization_incompatibility_reason(c):
                     raise ValueError(
@@ -882,11 +898,22 @@ class ResponseGenerator:
                         f"{reason} Disable --kv-bits for this model."
                     )
             maybe_quantize_kv_cache(
-                cache,
+                model_cache,
                 quantized_kv_start=self.model_provider.cli_args.quantized_kv_start,
                 kv_group_size=self.model_provider.cli_args.kv_group_size,
                 kv_bits=self.model_provider.cli_args.kv_bits,
+                mla_mode=hasattr(getattr(model, "args", None), "kv_lora_rank"),
             )
+            if draft_cache:
+                maybe_quantize_kv_cache(
+                    draft_cache,
+                    quantized_kv_start=self.model_provider.cli_args.quantized_kv_start,
+                    kv_group_size=self.model_provider.cli_args.kv_group_size,
+                    kv_bits=self.model_provider.cli_args.kv_bits,
+                    mla_mode=hasattr(
+                        getattr(draft_model, "args", None), "kv_lora_rank"
+                    ),
+                )
         return cache
 
     def _memory_admission_error(

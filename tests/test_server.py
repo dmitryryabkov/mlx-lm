@@ -16,6 +16,7 @@ from mlx_lm.models.cache import (
     CacheList,
     KVCache,
     QuantizedKVCache,
+    QuantizedMLAKVCache,
     QuantizedRotatingKVCache,
     RotatingKVCache,
     cache_quantization_incompatibility_reason,
@@ -660,6 +661,17 @@ class TestCacheQuantizationCapabilities(unittest.TestCase):
             self.assertIsInstance(qv, tuple)
         self.assertLessEqual(cache.size(), 8)
 
+    def test_quantized_mla_cache_returns_dense_values(self):
+        cache = KVCache().to_mla_quantized(group_size=32, bits=8)
+        keys = mx.random.normal((1, 2, 1, 32))
+        values = mx.random.normal((1, 1, 1, 16))
+        out_k, out_v = cache.update_and_fetch(keys, values)
+        self.assertIsInstance(cache, QuantizedMLAKVCache)
+        self.assertFalse(isinstance(out_k, tuple))
+        self.assertFalse(isinstance(out_v, tuple))
+        self.assertEqual(out_k.shape[-2], 1)
+        self.assertEqual(out_v.shape[-2], 1)
+
 
 class TestBatchability(unittest.TestCase):
     def _make_response_generator(self, is_batchable=True, kv_bits=None):
@@ -700,17 +712,20 @@ class TestCLIValidation(unittest.TestCase):
 
 
 class TestKVQuantModelCompatibility(unittest.TestCase):
-    def test_mla_models_report_unsupported(self):
+    def test_mla_models_report_supported_without_rotating_cache(self):
         model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
-        self.assertFalse(model_supports_kv_quantization(model))
+        self.assertTrue(model_supports_kv_quantization(model))
 
     def test_non_mla_models_report_supported(self):
         model = type("obj", (), {"args": type("obj", (), {"hidden_size": 1024})()})()
         self.assertTrue(model_supports_kv_quantization(model))
 
-    def test_incompatibility_reason_for_mla_models(self):
+    def test_incompatibility_reason_for_mla_models_with_rotating_cache(self):
         model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
-        self.assertIn("MLA-style models", kv_quantization_incompatibility_reason(model))
+        self.assertIn(
+            "MLA-style models",
+            kv_quantization_incompatibility_reason(model, max_kv_size=1024),
+        )
 
     def test_rotating_cache_model_reports_supported(self):
         model = type(
@@ -725,7 +740,7 @@ class TestKVQuantModelCompatibility(unittest.TestCase):
 
 
 class TestKVQuantPromptCacheGuard(unittest.TestCase):
-    def test_make_prompt_cache_rejects_incompatible_model(self):
+    def test_make_prompt_cache_quantizes_mla_model_cache(self):
         from unittest.mock import patch
 
         rg = ResponseGenerator.__new__(ResponseGenerator)
@@ -747,9 +762,9 @@ class TestKVQuantPromptCacheGuard(unittest.TestCase):
         )()
 
         model = type("obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()})()
-        with patch("mlx_lm.server.make_prompt_cache", return_value=[]):
-            with self.assertRaisesRegex(ValueError, "MLA-style models"):
-                rg._make_prompt_cache(model)
+        with patch("mlx_lm.server.make_prompt_cache", return_value=[KVCache()]):
+            cache = rg._make_prompt_cache(model)
+            self.assertIsInstance(cache[0], QuantizedMLAKVCache)
 
 
 class TestKVQuantStartupValidation(unittest.TestCase):
@@ -767,11 +782,13 @@ class TestKVQuantStartupValidation(unittest.TestCase):
                 "adapter_path": None,
                 "draft_model": None,
                 "kv_bits": 4,
+                "max_kv_size": None,
             },
         )()
 
-    def test_load_rejects_incompatible_model_when_kv_bits_enabled(self):
+    def test_load_rejects_mla_model_with_rotating_cache_and_kv_bits_enabled(self):
         args = self._cli_args()
+        args.max_kv_size = 1024
         incompatible_model = type(
             "obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()}
         )()
@@ -789,6 +806,7 @@ class TestKVQuantStartupValidation(unittest.TestCase):
     def test_load_rejects_incompatible_default_model_with_real_name(self):
         args = self._cli_args()
         args.model = "mlx-community/Foo-MLA-4bit"
+        args.max_kv_size = 1024
         incompatible_model = type(
             "obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()}
         )()
@@ -821,6 +839,22 @@ class TestKVQuantStartupValidation(unittest.TestCase):
             provider = ModelProvider(args)
             model, _ = provider.load("any-model")
             self.assertIs(model, compatible_model)
+
+    def test_load_allows_mla_model_without_rotating_cache(self):
+        args = self._cli_args()
+        mla_model = type(
+            "obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()}
+        )()
+        tokenizer = type(
+            "obj",
+            (),
+            {"vocab_size": 100, "chat_template": None, "default_chat_template": None},
+        )()
+
+        with patch("mlx_lm.server.load", return_value=(mla_model, tokenizer)):
+            provider = ModelProvider(args)
+            model, _ = provider.load("any-model")
+            self.assertIs(model, mla_model)
 
 
 class TestPromptTokenLimit(unittest.TestCase):

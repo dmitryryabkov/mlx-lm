@@ -334,6 +334,136 @@ class QuantizedKVCache(_BaseCache):
         )
 
 
+class QuantizedMLAKVCache(_BaseCache):
+    """
+    KV cache variant for MLA-style attention.
+
+    The latent KV tensor is stored quantized, while the positional K tensor
+    (``values`` argument in ``update_and_fetch``) is stored dense. Fetch returns
+    dequantized latent KV and dense positional K, matching model expectations.
+    """
+
+    step = 256
+    supports_quantization = True
+    quantization_mode = "full"
+
+    def __init__(self, group_size: int = 64, bits: int = 8):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.group_size = group_size
+        self.bits = bits
+
+    def update_and_fetch(self, keys, values):
+        B, n_kv_heads, num_steps, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        prev = self.offset
+
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
+            el_per_int = 8 * mx.uint32.size // self.bits
+            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_kv_heads, new_steps)
+
+            def init_quant(dim):
+                return (
+                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                )
+
+            def expand_quant(x):
+                new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
+                return mx.concatenate([x, new_x], axis=-2)
+
+            def expand_dense(x):
+                new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
+                return mx.concatenate([x, new_x], axis=-2)
+
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = tree_map(lambda x: x[..., :prev, :], self.keys)
+                    self.values = self.values[..., :prev, :]
+
+                self.keys = tree_map(expand_quant, self.keys)
+                self.values = expand_dense(self.values)
+            else:
+                self.keys = init_quant(k_head_dim)
+                self.values = mx.zeros((*shape, v_head_dim), dtype=values.dtype)
+
+        self.offset += num_steps
+
+        qkeys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        for i in range(len(self.keys)):
+            self.keys[i][..., prev : self.offset, :] = qkeys[i]
+        self.values[..., prev : self.offset, :] = values
+
+        qslice = tree_map(lambda x: x[..., : self.offset, :], self.keys)
+        k_latent = mx.dequantize(*qslice, group_size=self.group_size, bits=self.bits)
+        return k_latent, self.values[..., : self.offset, :]
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        if self.offset == self.keys[0].shape[2]:
+            return self.keys, self.values
+        else:
+            return (
+                tree_map(lambda x: x[..., : self.offset, :], self.keys),
+                self.values[..., : self.offset, :],
+            )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self.group_size, self.bits = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        if self.group_size == group_size and self.bits == bits:
+            return self
+        quant_cache = QuantizedMLAKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        if self.keys is not None:
+            dense_keys = mx.dequantize(
+                *self.keys, group_size=self.group_size, bits=self.bits
+            )
+            quant_cache.keys = mx.quantize(dense_keys, group_size=group_size, bits=bits)
+            quant_cache.values = self.values
+        return quant_cache
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(
+            lambda a, x: a + (x.nbytes if x is not None else 0),
+            (self.keys, self.values),
+            0,
+        )
+
+
 class KVCache(_BaseCache):
     step = 256
     supports_quantization = True
@@ -402,6 +532,14 @@ class KVCache(_BaseCache):
             quant_cache.values = mx.quantize(
                 self.values, group_size=group_size, bits=bits
             )
+        return quant_cache
+
+    def to_mla_quantized(self, group_size: int = 64, bits: int = 4):
+        quant_cache = QuantizedMLAKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        if self.keys is not None:
+            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            quant_cache.values = self.values
         return quant_cache
 
     def make_mask(self, *args, **kwargs):
@@ -1686,18 +1824,24 @@ def can_quantize_cache(cache: _BaseCache) -> bool:
 
 
 def quantize_cache(
-    cache: _BaseCache, *, group_size: int = 64, bits: int = 4
+    cache: _BaseCache, *, group_size: int = 64, bits: int = 4, mla_mode: bool = False
 ) -> _BaseCache:
     if isinstance(cache, CacheList):
         return CacheList(
-            *(quantize_cache(c, group_size=group_size, bits=bits) for c in cache.caches)
+            *(
+                quantize_cache(c, group_size=group_size, bits=bits, mla_mode=mla_mode)
+                for c in cache.caches
+            )
         )
 
     if reason := cache_quantization_incompatibility_reason(cache):
         raise ValueError(reason)
 
-    if isinstance(cache, QuantizedKVCache):
+    if isinstance(cache, (QuantizedKVCache, QuantizedMLAKVCache)):
         return cache
+
+    if mla_mode and isinstance(cache, KVCache):
+        return cache.to_mla_quantized(group_size=group_size, bits=bits)
 
     try:
         return cache.to_quantized(group_size=group_size, bits=bits)
