@@ -661,16 +661,25 @@ class TestCacheQuantizationCapabilities(unittest.TestCase):
             self.assertIsInstance(qv, tuple)
         self.assertLessEqual(cache.size(), 8)
 
-    def test_quantized_mla_cache_returns_dense_values(self):
+    def test_quantized_mla_cache_decode_returns_quantized(self):
         cache = KVCache().to_mla_quantized(group_size=32, bits=8)
         keys = mx.random.normal((1, 2, 1, 32))
         values = mx.random.normal((1, 1, 1, 16))
         out_k, out_v = cache.update_and_fetch(keys, values)
         self.assertIsInstance(cache, QuantizedMLAKVCache)
-        self.assertFalse(isinstance(out_k, tuple))
+        self.assertTrue(isinstance(out_k, (tuple, list)))
         self.assertFalse(isinstance(out_v, tuple))
-        self.assertEqual(out_k.shape[-2], 1)
         self.assertEqual(out_v.shape[-2], 1)
+
+    def test_quantized_mla_cache_prefill_returns_dense_latent(self):
+        cache = KVCache().to_mla_quantized(group_size=32, bits=8)
+        keys = mx.random.normal((1, 2, 4, 32))
+        values = mx.random.normal((1, 1, 4, 16))
+        out_k, out_v = cache.update_and_fetch(keys, values)
+        self.assertFalse(isinstance(out_k, (tuple, list)))
+        self.assertFalse(isinstance(out_v, tuple))
+        self.assertEqual(out_k.shape[-2], 4)
+        self.assertEqual(out_v.shape[-2], 4)
 
 
 class TestBatchability(unittest.TestCase):

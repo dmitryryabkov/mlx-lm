@@ -398,6 +398,9 @@ class QuantizedMLAKVCache(_BaseCache):
         self.values[..., prev : self.offset, :] = values
 
         qslice = tree_map(lambda x: x[..., : self.offset, :], self.keys)
+        if num_steps == 1:
+            return qslice, self.values[..., : self.offset, :]
+
         k_latent = mx.dequantize(*qslice, group_size=self.group_size, bits=self.bits)
         return k_latent, self.values[..., : self.offset, :]
 
