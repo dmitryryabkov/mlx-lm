@@ -643,6 +643,17 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
+        if self.cli_args.kv_bits is not None:
+            if reason := kv_quantization_incompatibility_reason(self.model):
+                raise ValueError(
+                    f"{reason} Disable --kv-bits for model '{model_path}'."
+                )
+            if self.draft_model is not None:
+                if reason := kv_quantization_incompatibility_reason(self.draft_model):
+                    raise ValueError(
+                        f"{reason} Disable --kv-bits for draft model '{draft_model_path}'."
+                    )
+
         if self.draft_model is None:
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)

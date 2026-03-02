@@ -15,6 +15,7 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    ModelProvider,
     ResponseGenerator,
     apply_prompt_token_limit,
     is_metal_oom_error,
@@ -699,6 +700,57 @@ class TestKVQuantPromptCacheGuard(unittest.TestCase):
         with patch("mlx_lm.server.make_prompt_cache", return_value=[]):
             with self.assertRaisesRegex(ValueError, "MLA-style models"):
                 rg._make_prompt_cache(model)
+
+
+class TestKVQuantStartupValidation(unittest.TestCase):
+    @staticmethod
+    def _cli_args():
+        return type(
+            "obj",
+            (object,),
+            {
+                "model": None,
+                "pipeline": False,
+                "trust_remote_code": False,
+                "chat_template": "",
+                "use_default_chat_template": False,
+                "adapter_path": None,
+                "draft_model": None,
+                "kv_bits": 4,
+            },
+        )()
+
+    def test_load_rejects_incompatible_model_when_kv_bits_enabled(self):
+        args = self._cli_args()
+        incompatible_model = type(
+            "obj", (), {"args": type("obj", (), {"kv_lora_rank": 512})()}
+        )()
+        tokenizer = type(
+            "obj",
+            (),
+            {"vocab_size": 100, "chat_template": None, "default_chat_template": None},
+        )()
+
+        with patch("mlx_lm.server.load", return_value=(incompatible_model, tokenizer)):
+            provider = ModelProvider(args)
+            with self.assertRaisesRegex(ValueError, "Disable --kv-bits"):
+                provider.load("any-model")
+
+    def test_load_allows_compatible_model_when_kv_bits_enabled(self):
+        args = self._cli_args()
+        compatible_model = type(
+            "obj", (), {"args": type("obj", (), {"hidden_size": 1})()}
+        )()
+        tokenizer = type(
+            "obj",
+            (),
+            {"vocab_size": 100, "chat_template": None, "default_chat_template": None},
+        )()
+
+        with patch("mlx_lm.server.load", return_value=(compatible_model, tokenizer)):
+            provider = ModelProvider(args)
+            model, _ = provider.load("any-model")
+            self.assertIs(model, compatible_model)
 
 
 class TestPromptTokenLimit(unittest.TestCase):
