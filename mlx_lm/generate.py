@@ -381,12 +381,13 @@ def generate_step(
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
+    mla_mode = hasattr(getattr(model, "args", None), "kv_lora_rank")
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
-        mla_mode=hasattr(getattr(model, "args", None), "kv_lora_rank"),
+        mla_mode=mla_mode,
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -421,7 +422,8 @@ def generate_step(
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
-            quantize_cache_fn(prompt_cache)
+            if not mla_mode or input_tokens.size == 1:
+                quantize_cache_fn(prompt_cache)
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
@@ -444,7 +446,8 @@ def generate_step(
                     else None
                 ),
             )
-            quantize_cache_fn(prompt_cache)
+            if not mla_mode:
+                quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
@@ -548,13 +551,15 @@ def speculative_generate_step(
             logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
-            maybe_quantize_kv_cache(
-                cache,
-                quantized_kv_start=quantized_kv_start,
-                kv_group_size=kv_group_size,
-                kv_bits=kv_bits,
-                mla_mode=hasattr(getattr(model, "args", None), "kv_lora_rank"),
-            )
+            model_mla = hasattr(getattr(model, "args", None), "kv_lora_rank")
+            if not model_mla or y.size == 1:
+                maybe_quantize_kv_cache(
+                    cache,
+                    quantized_kv_start=quantized_kv_start,
+                    kv_group_size=kv_group_size,
+                    kv_bits=kv_bits,
+                    mla_mode=model_mla,
+                )
             if logits_processors:
                 nonlocal prev_tokens
                 out_y, out_logprobs = [], []
@@ -578,7 +583,15 @@ def speculative_generate_step(
     def _prefill(model, cache, y):
         while y.size > prefill_step_size:
             model(y[:prefill_step_size][None], cache=cache)
-            quantize_cache_fn(cache)
+            model_mla = hasattr(getattr(model, "args", None), "kv_lora_rank")
+            if not model_mla:
+                maybe_quantize_kv_cache(
+                    cache,
+                    quantized_kv_start=quantized_kv_start,
+                    kv_group_size=kv_group_size,
+                    kv_bits=kv_bits,
+                    mla_mode=model_mla,
+                )
             mx.eval([c.state for c in cache])
             y = y[prefill_step_size:]
             mx.clear_cache()
